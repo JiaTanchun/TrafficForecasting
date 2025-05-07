@@ -415,3 +415,90 @@ class CSDI_Forecasting(CSDI_base):
             samples = self.impute(observed_data, cond_mask, side_info, n_samples)
 
         return samples, observed_data, target_mask, observed_mask, observed_tp
+
+import torch
+import torch.nn as nn
+from diff_models import diff_CSDI
+import numpy as np
+
+class CSDI_Speed(CSDI_base):
+    def __init__(self, config, device):
+        # D = Speed + Weather 个数
+        D = config["model"]["data_dim"]
+        super().__init__(target_dim=D, config=config, device=device)
+
+    def process_data(self, batch):
+        # batch['observed_data']: (B, T, D)
+        # batch['observed_mask']: (B, T, D)
+        # batch['gt_mask']:       (B, T, 1)  -- Speed 的真值 mask
+        # batch['timepoints']:    (T,) 或 (B, T)
+        full = batch["observed_data"].to(self.device).float()
+        full_mask = batch["observed_mask"].to(self.device).float()
+        tp = batch["timepoints"].to(self.device).float()
+        speed_gt = batch["gt_mask"].to(self.device).float()  # (B, T, 1)
+
+        # 转成 (B, D, T)
+        obs_data = full.permute(0, 2, 1)
+        obs_mask = full_mask.permute(0, 2, 1)
+        speed_gt = speed_gt.permute(0, 2, 1)
+
+        # 用于 hist_mask 的原始观测 mask（只用在 hist 策略）
+        hist_mask = obs_mask[:, 0:1, :].clone()
+
+        cut_length = torch.zeros(obs_data.size(0), dtype=torch.long, device=self.device)
+        return obs_data, obs_mask, tp, speed_gt, hist_mask, cut_length
+
+    def forward(self, batch, is_train=1):
+        obs_data, obs_mask, tp, speed_gt, hist_mask, _ = self.process_data(batch)
+        B, D, L = obs_mask.shape
+
+        # 构造 Speed 条件 mask
+        if is_train == 0:
+            # 验证/测试阶段：直接用真值 mask
+            cond_speed = speed_gt           # (B,1,L)
+        elif self.target_strategy == "random":
+            # 训练阶段 random 策略：只对 Speed 随机掩码
+            cond_speed = self.get_randmask(obs_mask[:, 0:1, :])
+        else:
+            # 训练阶段 mix 或 hist 策略
+            cond_speed = self.get_hist_mask(obs_mask[:, 0:1, :], hist_mask)
+
+        # 其他通道始终观测完备
+        other_cond = obs_mask[:, 1:, :]      # (B, D-1, L)
+        cond_mask = torch.cat([cond_speed, other_cond], dim=1)  # (B, D, L)
+
+        # 生成 side_info
+        side_info = self.get_side_info(tp, cond_mask)
+
+        # 计算 loss
+        loss_fn = self.calc_loss if is_train == 1 else self.calc_loss_valid
+        return loss_fn(obs_data, cond_mask, obs_mask, side_info, is_train)
+
+
+    def evaluate(self, batch, n_samples):
+        # process_data 里 full 是 (B,T,D) 归一化后的完整数据
+        full   = batch["observed_data"].to(self.device).float()  
+        full_mask = batch["observed_mask"].to(self.device).float()
+        tp     = batch["timepoints"].to(self.device).float()
+        speed_gt = batch["gt_mask"].to(self.device).float()     # (B,T,1)
+
+        # reshape 到模型内部用的 (B,D,T)
+        obs_data = full.permute(0,2,1)
+        obs_mask = full_mask.permute(0,2,1)
+        speed_gt = speed_gt.permute(0,2,1)
+
+        # 构造 cond_mask：Speed 用真值 mask，其它通道全观测
+        cond_speed = speed_gt
+        other_cond = obs_mask[:,1:,:]
+        cond_mask  = torch.cat([cond_speed, other_cond], dim=1)
+
+        side_info = self.get_side_info(tp, cond_mask)
+        samples   = self.impute(obs_data, cond_mask, side_info, n_samples)
+
+        # 只评测 Speed 通道
+        target_mask = obs_mask[:,0:1,:] - cond_speed
+
+        # 这里把 full_seq 也返回出来，用来做“真实值”
+        full_seq = obs_data                # (B,D,T)
+        full_seq = full_seq.permute(0,2,1) # (B,T,D)
+        return samples, full_seq, target_mask, obs_mask, tp
